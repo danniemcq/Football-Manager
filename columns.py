@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import importlib.util
 from pathlib import Path
 from typing import Dict, Tuple, List
 
@@ -37,7 +38,6 @@ _money_pat = re.compile(r"£\s*([\d.,]+)\s*([KkMm])?")
 
 
 def parse_attr_range(value: str) -> Tuple[int, int, float]:
-    """Per user's rules: 'a-b' -> (a,b,mid); 'n' -> (n,n,n); '-'/empty -> (0,0,0)."""
     if value is None:
         return 0, 0, 0.0
     s = str(value).strip()
@@ -101,7 +101,6 @@ def load_stats_html(path: Path) -> pd.DataFrame:
         raise ValueError("No tables found in stats HTML")
     df = tables[0]
 
-    # Disambiguate first 'Nat' to Nationality (later mapped 'Nat' == Natural Fitness)
     cols = list(df.columns)
     nat_indices = [i for i, c in enumerate(cols) if str(c).strip().lower() == "nat"]
     if nat_indices:
@@ -140,21 +139,14 @@ def rename_attributes_with_mapping(df: pd.DataFrame, mapping: Dict[str, str]) ->
     return df.rename(columns=colmap)
 
 
-def _flatten_role_weights(role_weights_nested: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    flat: Dict[str, float] = {}
-    for _cat, block in role_weights_nested.items():
-        for k, v in block.items():
-            flat[str(k)] = float(v)
-    return flat
-
-
-def compute_role_score(df: pd.DataFrame, role: str, roles_data_map: Dict[str, Dict[str, Dict[str, float]]], mapping: Dict[str, str]) -> pd.DataFrame:
-    if role not in roles_data_map:
+def compute_role_score(df: pd.DataFrame, role: str, roles_data: Dict[str, Dict[str, Dict[str, float]]], mapping: Dict[str, str]) -> pd.DataFrame:
+    if role not in roles_data:
         raise KeyError(f"Role '{role}' not found in roles_data")
 
-    weights = _flatten_role_weights(roles_data_map[role])
+    weights_nested = roles_data[role]
+    weights = {k: v for cat in weights_nested.values() for k, v in cat.items()}
 
-    resolved_cols: Dict[str, float] = {}
+    resolved_cols = {}
     for k, w in weights.items():
         full = mapping.get(k, k)
         candidates = [f"{full}_mean", f"{k}_mean"]
@@ -182,15 +174,12 @@ class FMApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("FM Role Explorer")
-        self.geometry("1320x860")
+        self.geometry("1200x800")
 
         self.df_raw: pd.DataFrame | None = None
         self.df_view: pd.DataFrame | None = None
-        self.df_display: pd.DataFrame | None = None
-        self.tiers: List[str] = []
 
         self._build_header()
-        self._build_filters()
         self._build_table()
         self._build_plot()
 
@@ -200,43 +189,18 @@ class FMApp(tk.Tk):
 
         ttk.Label(frm, text="Role:").pack(side=tk.LEFT)
         self.role_var = tk.StringVar()
-        self.role_combo = ttk.Combobox(frm, textvariable=self.role_var, state="readonly", width=36)
-        self.role_combo.pack(side=tk.LEFT, padx=6)
+        self.role_combo = ttk.Combobox(frm, textvariable=self.role_var, state="readonly", width=40)
+        self.role_combo.pack(side=tk.LEFT, padx=8)
 
-        ttk.Button(frm, text="Open stats.html…", command=self.on_open_html).pack(side=tk.LEFT, padx=6)
-        ttk.Button(frm, text="Apply Role & Sort", command=self.on_apply_role).pack(side=tk.LEFT, padx=6)
-
-        ttk.Label(frm, text="Tier:").pack(side=tk.LEFT, padx=(18,4))
-        self.tier_var = tk.StringVar()
-        self.tier_combo = ttk.Combobox(frm, textvariable=self.tier_var, state="readonly", width=10)
-        self.tier_combo.pack(side=tk.LEFT, padx=4)
-        self.tier_combo.bind("<<ComboboxSelected>>", lambda e: self.on_selection_changed())
+        ttk.Button(frm, text="Open stats.html…", command=self.on_open_html).pack(side=tk.LEFT, padx=4)
+        ttk.Button(frm, text="Apply Role & Sort", command=self.on_apply_role).pack(side=tk.LEFT, padx=4)
+        ttk.Label(frm, text="(Select up to 3 players in the table to compare below)").pack(side=tk.LEFT, padx=16)
 
         if roles_data:
             vals = sorted(list(roles_data.keys()))
             self.role_combo["values"] = vals
             if vals:
                 self.role_var.set(vals[0])
-                self._refresh_tiers()
-
-    def _build_filters(self):
-        frm = ttk.Frame(self)
-        frm.pack(fill=tk.X, padx=8, pady=(0,8))
-
-        ttk.Label(frm, text="RoleScore ≥").pack(side=tk.LEFT)
-        self.min_score_var = tk.StringVar(value="0")
-        ttk.Entry(frm, width=7, textvariable=self.min_score_var).pack(side=tk.LEFT, padx=(4,12))
-
-        ttk.Label(frm, text="Age ≤").pack(side=tk.LEFT)
-        self.max_age_var = tk.StringVar(value="100")
-        ttk.Entry(frm, width=7, textvariable=self.max_age_var).pack(side=tk.LEFT, padx=(4,12))
-
-        ttk.Label(frm, text="Max Value ≤ £").pack(side=tk.LEFT)
-        self.max_val_var = tk.StringVar(value="100000000")
-        ttk.Entry(frm, width=12, textvariable=self.max_val_var).pack(side=tk.LEFT, padx=(4,12))
-
-        ttk.Button(frm, text="Apply Filters", command=self.apply_filters).pack(side=tk.LEFT, padx=6)
-        ttk.Button(frm, text="Clear Filters", command=self.clear_filters).pack(side=tk.LEFT, padx=6)
 
     def _build_table(self):
         container = ttk.Frame(self)
@@ -246,7 +210,7 @@ class FMApp(tk.Tk):
         self.tree = ttk.Treeview(container, columns=cols, show="headings", selectmode="extended")
         for c in cols:
             self.tree.heading(c, text=c)
-            self.tree.column(c, stretch=True, width=140 if c == "Name" else 120)
+            self.tree.column(c, stretch=True, width=120)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         yscroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.tree.yview)
@@ -259,25 +223,14 @@ class FMApp(tk.Tk):
         self.plot_frame = ttk.Frame(self)
         self.plot_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
 
-        self.fig = Figure(figsize=(10, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111, projection='polar')
-        self.ax.set_title("Radar: selected players by tier")
+        self.fig = Figure(figsize=(10, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Selected players vs role attributes (mean)")
+        self.ax.set_xlabel("Attribute")
+        self.ax.set_ylabel("Mean")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _refresh_tiers(self):
-        role = self.role_var.get()
-        if not role or role not in roles_data:
-            self.tier_combo["values"] = []
-            self.tier_var.set("")
-            return
-        flat = _flatten_role_weights(roles_data[role])
-        tiers = sorted({int(v) for v in flat.values()}, reverse=True)
-        self.tiers = ["All"] + [str(t) for t in tiers]
-        self.tier_combo["values"] = self.tiers
-        if self.tier_var.get() not in self.tiers:
-            self.tier_var.set("All")
 
     def on_open_html(self):
         p = filedialog.askopenfilename(title="Open stats.html", filetypes=[("HTML", "*.html"), ("All Files", "*.*")])
@@ -288,8 +241,7 @@ class FMApp(tk.Tk):
             df = rename_attributes_with_mapping(df, attribute_mapping)
             self.df_raw = df
             self.df_view = df.copy()
-            self.df_display = self.df_view.copy()
-            self.populate_table(self.df_display)
+            self.populate_table(self.df_view)
             messagebox.showinfo("Loaded", f"Loaded {len(df)} rows from stats HTML.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load stats: {e}")
@@ -306,48 +258,9 @@ class FMApp(tk.Tk):
             df_scored = compute_role_score(self.df_raw, role, roles_data, attribute_mapping)
             df_scored = df_scored.sort_values("RoleScore", ascending=False)
             self.df_view = df_scored
-            self._refresh_tiers()
-            self.apply_filters()
+            self.populate_table(self.df_view)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to score role: {e}")
-
-    def apply_filters(self):
-        if self.df_view is None:
-            return
-        df = self.df_view.copy()
-        df["RoleScore_num"] = pd.to_numeric(df.get("RoleScore", np.nan), errors="coerce")
-        df["Age_num"] = pd.to_numeric(df.get("Age", np.nan), errors="coerce")
-        df["ValueMax_num"] = pd.to_numeric(df.get("ValueMax_GBP", np.nan), errors="coerce")
-
-        try:
-            min_score = float(self.min_score_var.get() or 0)
-        except ValueError:
-            min_score = 0.0
-        try:
-            max_age = float(self.max_age_var.get() or 1e9)
-        except ValueError:
-            max_age = 1e9
-        try:
-            max_value = float(self.max_val_var.get() or 1e18)
-        except ValueError:
-            max_value = 1e18
-
-        mask = (
-            (df["RoleScore_num"].fillna(-1) >= min_score) &
-            (df["Age_num"].fillna(1e9) <= max_age) &
-            (df["ValueMax_num"].fillna(1e18) <= max_value)
-        )
-        df = df[mask].drop(columns=["RoleScore_num", "Age_num", "ValueMax_num"], errors='ignore')
-
-        self.df_display = df
-        self.populate_table(self.df_display)
-        self.on_selection_changed()
-
-    def clear_filters(self):
-        self.min_score_var.set("0")
-        self.max_age_var.set("100")
-        self.max_val_var.set("100000000")
-        self.apply_filters()
 
     def populate_table(self, df: pd.DataFrame):
         for iid in self.tree.get_children():
@@ -357,93 +270,60 @@ class FMApp(tk.Tk):
         self.tree["columns"] = display_cols
         for c in display_cols:
             self.tree.heading(c, text=c)
-            self.tree.column(c, width=160 if c == "Name" else 120, anchor=tk.W)
+            self.tree.column(c, width=140 if c == "Name" else 110, anchor=tk.W)
 
         for i, row in df.reset_index(drop=True).iterrows():
             values = [row.get(c, "") for c in display_cols]
             self.tree.insert("", tk.END, iid=str(i), values=values)
 
     def on_selection_changed(self, event=None):
-        if self.df_display is None:
+        if self.df_view is None:
             return
         sel = self.tree.selection()
-        if len(sel) == 0:
-            self._clear_plot()
+        if not sel:
+            self.ax.clear()
+            self.ax.set_title("Selected players vs role attributes (mean)")
+            self.ax.set_xlabel("Attribute")
+            self.ax.set_ylabel("Mean")
+            self.canvas.draw()
             return
         if len(sel) > 3:
             messagebox.showinfo("Limit", "Please select up to 3 players.")
             return
 
         role = self.role_var.get()
-        if not role or role not in roles_data or not attribute_mapping:
-            self._clear_plot("Select a role and load mapping/roles files")
+        if not role or not roles_data or not attribute_mapping:
             return
+        weights_nested = roles_data.get(role, {})
+        weights = {k: v for cat in weights_nested.values() for k, v in cat.items()}
 
-        # Tier selection ("All" = no filter)
-        tier_choice = self.tier_var.get()
-        flat = _flatten_role_weights(roles_data.get(role, {}))
-        if tier_choice and tier_choice != "All":
-            try:
-                tier_val = int(tier_choice)
-                flat = {k: v for k, v in flat.items() if int(v) == tier_val}
-            except ValueError:
-                pass
-        if not flat:
-            self._clear_plot(msg=f"No attributes at tier {tier_choice} for {role}")
-            return
-
-        # Resolve attributes to *_mean columns
-        attrs_full = [attribute_mapping.get(k, k) for k in flat.keys()]
-        mean_cols = [f"{a}_mean" for a in attrs_full]
-        present = [(a, c) for a, c in zip(attrs_full, mean_cols) if c in (self.df_display.columns)]
+        attr_full_names = [attribute_mapping.get(k, k) for k in weights.keys()]
+        mean_cols = [f"{a}_mean" for a in attr_full_names]
+        present = [(a, c) for a, c in zip(attr_full_names, mean_cols) if c in self.df_view.columns]
         if not present:
-            # Fallback via reverse mapping
-            reverse_map = {v: k for k, v in attribute_mapping.items()}
-            all_means = [c for c in self.df_display.columns if c.endswith('_mean')]
-            targets = set(attrs_full)
-            fallback = []
-            for c in all_means:
-                base = c[:-5]
-                if base in targets or reverse_map.get(base, base) in flat:
-                    fallback.append((base, c))
-            present = fallback
-        if not present:
-            self._clear_plot(msg="No matching attribute columns in data")
             return
 
-        # Build selected rows from the visible table order
-        # Treeview iids are positional (0..N-1) from last populate_table
-        selected_positions = [int(iid) for iid in sel]
-        df_tbl = self.df_display.reset_index(drop=True)
-        try:
-            df_sel = df_tbl.iloc[selected_positions]
-        except Exception:
-            self._clear_plot("Could not map selection to data")
-            return
-
-        labels = [a for a, _ in present]
-        while len(labels) < 3:
-            present.append(present[-1])
-            labels = [a for a, _ in present]
-        angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False)
-        angles = np.concatenate([angles, angles[:1]])
+        df_idx = [int(iid) for iid in sel]
+        df_sel = self.df_view.iloc[df_idx]
 
         self.ax.clear()
-        self.ax.set_theta_offset(np.pi / 2)
-        self.ax.set_theta_direction(-1)
-        self.ax.set_thetagrids(np.degrees(angles[:-1]), labels)
-        self.ax.set_rlabel_position(0)
-        self.ax.set_ylim(0, 20)
-        self.ax.set_title(f"{role} – Tier {tier_choice or 'All'}", pad=20)
+        attrs = [a for a, _ in present]
+        x = np.arange(len(attrs))
+        width = 0.8 / max(1, len(df_sel))
 
-        for _, r in df_sel.iterrows():
-            y = [float(r.get(c, 0)) for _, c in present]
-            y = np.asarray(y)
-            y = np.concatenate([y, y[:1]])
-            self.ax.plot(angles, y, linewidth=2)
-            self.ax.fill(angles, y, alpha=0.1)
+        for j, (_, r) in enumerate(df_sel.iterrows()):
+            y = [float(r[c]) for _, c in present]
+            self.ax.bar(x + j * width, y, width=width, label=str(r.get("Name", f"Player {j+1}")))
 
-        names = [str(r.get("Name", "Player")) for _, r in df_sel.iterrows()]
-        self.ax.legend(names, loc='upper right', bbox_to_anchor=(1.2, 1.1), frameon=False)
+        self.ax.set_xticks(x + width * (len(df_sel) - 1) / 2)
+        self.ax.set_xticklabels(attrs, rotation=45, ha="right")
+        self.ax.set_ylabel("Mean")
+        self.ax.set_title(f"{role}: attribute means for selected players")
+        self.ax.legend()
         self.fig.tight_layout()
         self.canvas.draw()
+
+
+if __name__ == "__main__":
+    app = FMApp()
+    app.mainloop()
